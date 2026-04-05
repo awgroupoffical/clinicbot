@@ -1,16 +1,16 @@
 require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const express = require('express');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const client = new Anthropic.default({ 
-  apiKey: process.env.ANTHROPIC_API_KEY 
+const client = new Anthropic.default({
+  apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-// Clinic Config - har client ke liye yeh badlo!
 const clinicConfig = {
   name: "Al Shifa Clinic",
   doctors: ["Dr. Ahmed", "Dr. Sara", "Dr. Ali"],
@@ -18,11 +18,52 @@ const clinicConfig = {
   location: "Main Boulevard, Lahore",
   phone: "+92-300-1234567",
   primaryColor: "#2ECC71",
-  language: "Urdu/English"
+  adminEmail: "mabdullahwarrich68@gmail.com"
 };
 
-// Conversation history store
+// Bookings store karne ke liye
+const bookings = [];
 const conversations = {};
+
+// Email bhejna
+async function sendEmailNotification(bookingData) {
+  try {
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+      }
+    });
+
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: clinicConfig.adminEmail,
+      subject: `New Appointment - ${clinicConfig.name}`,
+      html: `
+        <h2>New Appointment Booked!</h2>
+        <p><b>Patient:</b> ${bookingData.patientName}</p>
+        <p><b>Phone:</b> ${bookingData.phone}</p>
+        <p><b>Doctor:</b> ${bookingData.doctor}</p>
+        <p><b>Date:</b> ${bookingData.date}</p>
+        <p><b>Time:</b> ${bookingData.time}</p>
+        <p><b>Booked At:</b> ${new Date().toLocaleString()}</p>
+      `
+    });
+    console.log('Email sent!');
+  } catch (err) {
+    console.log('Email error:', err.message);
+  }
+}
+
+// Double booking check
+function isSlotBooked(doctor, date, time) {
+  return bookings.some(b => 
+    b.doctor === doctor && 
+    b.date === date && 
+    b.time === time
+  );
+}
 
 async function chat(userId, userMessage) {
   if (!conversations[userId]) {
@@ -34,16 +75,20 @@ async function chat(userId, userMessage) {
     content: userMessage
   });
 
+  const bookedSlots = bookings.map(b => 
+    `${b.doctor} - ${b.date} at ${b.time}`
+  ).join('\n') || 'None';
+
   const response = await client.messages.create({
     model: "claude-sonnet-4-6",
     max_tokens: 1024,
-    system: `You are a friendly clinic receptionist for ${clinicConfig.name}. 
-    
+    system: `You are a professional clinic receptionist for ${clinicConfig.name}.
+
 Your job:
 1. Help patients book appointments
 2. Answer questions about the clinic
 3. Handle rescheduling and cancellations
-4. Send reminders
+4. Prevent double bookings
 
 Clinic Info:
 - Doctors: ${clinicConfig.doctors.join(', ')}
@@ -51,28 +96,54 @@ Clinic Info:
 - Location: ${clinicConfig.location}
 - Phone: ${clinicConfig.phone}
 
+ALREADY BOOKED SLOTS (do NOT book these again):
+${bookedSlots}
+
 Rules:
-- Always be polite and friendly
-- Speak in Urdu/English mix (Hinglish style)
+- Always speak in professional English
 - Never give medical advice
 - Always confirm appointments by repeating details
+- If slot is already booked, suggest another time
 - If emergency, ask to call 1122
+- When booking is confirmed, include this EXACT format in your response:
+  BOOKING_CONFIRMED:patientName|phone|doctor|date|time
 
-When booking ask: Patient name, preferred doctor, preferred date and time.`,
+When booking ask: Patient name, phone number, preferred doctor, preferred date and time.`,
     messages: conversations[userId]
   });
 
   const assistantMessage = response.content[0].text;
-  
+
+  // Booking detect karo
+  if (assistantMessage.includes('BOOKING_CONFIRMED:')) {
+    const bookingLine = assistantMessage.match(/BOOKING_CONFIRMED:([^\n]+)/);
+    if (bookingLine) {
+      const parts = bookingLine[1].split('|');
+      const bookingData = {
+        patientName: parts[0],
+        phone: parts[1],
+        doctor: parts[2],
+        date: parts[3],
+        time: parts[4],
+        bookedAt: new Date().toLocaleString()
+      };
+
+      if (!isSlotBooked(bookingData.doctor, bookingData.date, bookingData.time)) {
+        bookings.push(bookingData);
+        sendEmailNotification(bookingData);
+        console.log('New booking:', bookingData);
+      }
+    }
+  }
+
   conversations[userId].push({
-    role: "assistant", 
-    content: assistantMessage
+    role: "assistant",
+    content: assistantMessage.replace(/BOOKING_CONFIRMED:[^\n]+/g, '')
   });
 
-  return assistantMessage;
+  return assistantMessage.replace(/BOOKING_CONFIRMED:[^\n]+/g, '');
 }
 
-// Web Widget endpoint
 app.get('/', (req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -94,7 +165,6 @@ app.get('/', (req, res) => {
     .chat-input { padding: 12px 16px; border-top: 1px solid #eee; display: flex; gap: 8px; }
     .chat-input input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 24px; outline: none; font-size: 14px; }
     .chat-input button { background: ${clinicConfig.primaryColor}; color: white; border: none; padding: 10px 18px; border-radius: 24px; cursor: pointer; font-size: 14px; }
-    .typing { color: #999; font-size: 13px; padding: 4px 8px; }
   </style>
 </head>
 <body>
@@ -104,10 +174,10 @@ app.get('/', (req, res) => {
       <p>Online • 24/7 Appointment Service</p>
     </div>
     <div class="chat-messages" id="messages">
-      <div class="message bot">Assalam o Alaikum! 👋 Main ${clinicConfig.name} ka AI receptionist hun. Appointment book karni hai ya koi sawaal hai?</div>
+      <div class="message bot">Hello! Welcome to ${clinicConfig.name}. I'm your AI receptionist. How can I help you today?</div>
     </div>
     <div class="chat-input">
-      <input type="text" id="userInput" placeholder="Apna message likhein..." onkeypress="if(event.key==='Enter') sendMessage()"/>
+      <input type="text" id="userInput" placeholder="Type your message..." onkeypress="if(event.key==='Enter') sendMessage()"/>
       <button onclick="sendMessage()">Send</button>
     </div>
   </div>
@@ -119,19 +189,12 @@ app.get('/', (req, res) => {
       if (!msg) return;
       addMessage(msg, 'user');
       input.value = '';
-      const typing = document.createElement('div');
-      typing.className = 'typing';
-      typing.id = 'typing';
-      typing.textContent = 'Receptionist likh raha hai...';
-      document.getElementById('messages').appendChild(typing);
-      scrollToBottom();
       const response = await fetch('/chat', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ userId, message: msg })
       });
       const data = await response.json();
-      document.getElementById('typing')?.remove();
       addMessage(data.reply, 'bot');
     }
     function addMessage(text, type) {
@@ -139,11 +202,7 @@ app.get('/', (req, res) => {
       div.className = 'message ' + type;
       div.textContent = text;
       document.getElementById('messages').appendChild(div);
-      scrollToBottom();
-    }
-    function scrollToBottom() {
-      const msgs = document.getElementById('messages');
-      msgs.scrollTop = msgs.scrollHeight;
+      document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
     }
   </script>
 </body>
@@ -151,7 +210,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Chat API
 app.post('/chat', async (req, res) => {
   try {
     const { userId, message } = req.body;
@@ -159,17 +217,15 @@ app.post('/chat', async (req, res) => {
     res.json({ reply });
   } catch (error) {
     console.error('Error:', error);
-    res.status(500).json({ reply: 'Sorry, kuch masla aa gaya. Dobara try karein.' });
+    res.status(500).json({ reply: 'Sorry, something went wrong. Please try again.' });
   }
 });
 
-const PORT = 3000;
+app.get('/bookings', (req, res) => {
+  res.json(bookings);
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════╗
-║   ClinicBot AI Agent - Running!   ║
-║   ${clinicConfig.name}            ║
-║   Open: http://localhost:3000     ║
-╚════════════════════════════════════╝
-  `);
+  console.log(`ClinicBot running on port ${PORT}`);
 });
